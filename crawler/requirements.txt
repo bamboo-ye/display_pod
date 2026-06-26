@@ -1,0 +1,3 @@
+beautifulsoup4==4.12.3
+confluent-kafka==2.5.3
+requests==2.32.3

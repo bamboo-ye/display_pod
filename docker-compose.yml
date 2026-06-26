@@ -1,0 +1,201 @@
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    container_name: display-pod-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: cvpr_display
+      MYSQL_USER: cvpr
+      MYSQL_PASSWORD: cvpr_pass
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --server-id=101
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot_pass --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.8.0}
+    container_name: display-pod-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.8.0}
+    container_name: display-pod-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -lc
+      - >
+        /opt/kafka/bin/kafka-topics.sh
+        --bootstrap-server kafka:9092
+        --create
+        --if-not-exists
+        --topic cvpr.raw.papers
+        --partitions 1
+        --replication-factor 1
+
+  flink-jobmanager:
+    image: ${FLINK_IMAGE:-flink:1.18-java11}
+    container_name: display-pod-flink-jobmanager
+    command: jobmanager
+    ports:
+      - "${FLINK_UI_PORT:-18082}:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+
+  flink-taskmanager:
+    image: ${FLINK_IMAGE:-flink:1.18-java11}
+    container_name: display-pod-flink-taskmanager
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+
+  flink-submit:
+    build:
+      context: ./flink-job
+      args:
+        MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3.9-eclipse-temurin-11}
+        FLINK_IMAGE: ${FLINK_IMAGE:-flink:1.18-java11}
+    container_name: display-pod-flink-submit
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+      flink-jobmanager:
+        condition: service_started
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: cvpr.raw.papers
+      MYSQL_URL: jdbc:mysql://mysql:3306/cvpr_display?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      MYSQL_USER: cvpr
+      MYSQL_PASSWORD: cvpr_pass
+    command: >
+      bash -lc "flink run -m flink-jobmanager:8081 -d -c com.displaypod.CvprPaperStreamJob /opt/flink/usrlib/cvpr-flink-job.jar && tail -f /dev/null"
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.22-alpine}
+        ALPINE_IMAGE: ${ALPINE_IMAGE:-alpine:3.20}
+    container_name: display-pod-backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_DSN: cvpr:cvpr_pass@tcp(mysql:3306)/cvpr_display?charset=utf8mb4&parseTime=true&loc=Local
+      MYSQL_DATABASE: cvpr_display
+      HTTP_ADDR: :8080
+      FRONTEND_ORIGIN: http://localhost:5173
+      BINLOG_ENABLED: "true"
+      BINLOG_HOST: mysql
+      BINLOG_PORT: "3306"
+      BINLOG_USER: replicator
+      BINLOG_PASSWORD: replicator_pass
+      BINLOG_SERVER_ID: "2001"
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: display-pod-frontend
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8080/api
+      VITE_WS_URL: ws://localhost:8080/api/ws
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+
+  crawler:
+    build:
+      context: ./crawler-go
+      dockerfile: Dockerfile.local
+    container_name: display-pod-crawler
+    profiles:
+      - tools
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: cvpr.raw.papers
+    command:
+      - --years
+      - 2021,2022,2023,2024,2025,2026
+      - --year-workers
+      - "6"
+
+  crawler-watch:
+    build:
+      context: ./crawler-go
+      dockerfile: Dockerfile.local
+    container_name: display-pod-crawler-watch
+    profiles:
+      - crawler
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: cvpr.raw.papers
+    volumes:
+      - crawler-state:/state
+    command:
+      - --years
+      - 2021,2022,2023,2024,2025,2026
+      - --year-workers
+      - "6"
+      - --watch
+      - --watch-interval
+      - 1h
+      - --state-file
+      - /state/openaccess_seen_ids.txt
+
+volumes:
+  mysql-data:
+  crawler-state:
