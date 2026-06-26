@@ -1,0 +1,24 @@
+.DS_Store
+.env
+*.log
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# Go
+backend/bin/
+backend/tmp/
+crawler-go/bin/
+
+# Java / Flink
+flink-job/target/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/bin/
+
+# Local data
+data/

@@ -1,0 +1,6 @@
+FROM alpine:3.21
+
+COPY dist /usr/share/nginx/html
+COPY bin/static-server /usr/local/bin/static-server
+EXPOSE 80
+CMD ["static-server"]

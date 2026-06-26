@@ -1,0 +1,8 @@
+FROM alpine:3.21
+
+RUN adduser -D -H appuser
+USER appuser
+
+COPY bin/display-pod-api /usr/local/bin/display-pod-api
+EXPOSE 8080
+CMD ["display-pod-api"]

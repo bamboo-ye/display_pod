@@ -1,0 +1,26 @@
+services:
+  flink-submit:
+    profiles:
+      - flink-job
+
+  backend:
+    build:
+      dockerfile: Dockerfile.local
+      args:
+        GO_IMAGE: golang:1.24-alpine
+        ALPINE_IMAGE: alpine:3.21
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.local
+
+  crawler:
+    build:
+      context: ./crawler-go
+      dockerfile: Dockerfile.local
+
+  crawler-watch:
+    build:
+      context: ./crawler-go
+      dockerfile: Dockerfile.local
